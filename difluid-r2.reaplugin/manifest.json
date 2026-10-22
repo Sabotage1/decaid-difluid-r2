@@ -1,0 +1,23 @@
+{
+  "id": "difluid-r2.reaplugin",
+  "name": "DiFluid R2 Refractometer",
+  "author": "Roy Ackerman",
+  "description": "Local Bluetooth TDS, refractive index, temperature and measurement status for the DiFluid R2 Extract (firmware 2.1.2 or later).",
+  "version": "0.1.0",
+  "apiVersion": 1,
+  "permissions": ["transport.ble", "log"],
+  "drivers": [{
+    "id": "difluid-r2",
+    "type": "sensor",
+    "ble": {"match": {"serviceUuids": ["000000ff-0000-1000-8000-00805f9b34fb"]}}
+  }],
+  "settings": {
+    "MeasurementTimeoutMs": {
+      "type": "number",
+      "label": "Measurement timeout (milliseconds)",
+      "description": "Maximum duration of a test before reporting a protocol failure to Decaid. Default 45000; integer 15000 to 180000. Idle devices do not time out.",
+      "default": 45000
+    }
+  },
+  "api": []
+}

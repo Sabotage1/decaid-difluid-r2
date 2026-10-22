@@ -1,0 +1,19 @@
+{
+  "name": "decaid-difluid-r2",
+  "version": "0.1.0",
+  "private": true,
+  "description": "DiFluid R2 Extract BLE refractometer sensor driver for Decaid 0.9.0",
+  "license": "GPL-3.0-or-later",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Sabotage1/decaid-difluid-r2.git"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "check": "node --check difluid-r2.reaplugin/plugin.js",
+    "build": "npm run check && npm test && node scripts/package.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
