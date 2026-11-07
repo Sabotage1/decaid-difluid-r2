@@ -16,6 +16,7 @@ Plugin version and installation method:
 - Discovery and connection:
 - Physical-button single test:
 - API-triggered single test:
+- API-triggered native average and requested count:
 - TDS/refractive-index comparison with the R2 display:
 - Celsius/Fahrenheit temperature comparison:
 - No-liquid/error handling:

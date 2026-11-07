@@ -106,6 +106,146 @@ test('passive average tests publish the aggregate rather than an intermediate sa
   await link.disconnect();
 });
 
+test('Sensors API advertises native average measurement with a required integer count', async () => {
+  const {driver, link} = await connected();
+  const command = driver.commands.find(command => command.id === 'measureAverage');
+  assert.ok(command);
+  assert.deepEqual(plain(command.paramsSchema), {type: 'object',
+    properties: {count: {type: 'integer', minimum: 2, maximum: 10}},
+    required: ['count'], additionalProperties: false});
+  await link.disconnect();
+});
+
+test('average count validation rejects missing, fractional, coerced and out-of-range requests without changing a reading', async () => {
+  const {link} = await connected();
+  await link.emit(reading);
+  const writes = link.writes.length, publications = link.published.length;
+  for (const params of [undefined, null, {}, [], 3, false, {count: null}, {count: '3'},
+    {count: false}, {count: 0}, {count: 1}, {count: -1}, {count: 1.5}, {count: 11},
+    {count: NaN}, {count: Infinity}, {count: 3, extra: true}]) {
+    await assert.rejects(link.execute({commandId: 'measureAverage', params}),
+      error => error.code === 'invalid_argument');
+  }
+  assert.equal(link.writes.length, writes);
+  assert.equal(link.published.length, publications);
+  assert.equal((await link.execute({commandId: 'getReading'})).reading.tds, 0.79);
+  await link.disconnect();
+});
+
+test('average requests share the measurement busy slot, including while the write is pending', async () => {
+  const written = deferred();
+  const {link} = await connected({write: data => data[2] === 3 ? written.promise : undefined});
+  const pending = link.execute({commandId: 'measureAverage', params: {count: 3}});
+  await assert.rejects(link.execute({commandId: 'measure'}), /busy/i);
+  await assert.rejects(link.execute({commandId: 'measureAverage', params: {count: 2}}), /busy/i);
+  await flush();
+  assert.equal(link.writes.filter(data => data[2] === 3).length, 1);
+  written.resolve();
+  await pending;
+  await link.disconnect();
+});
+
+test('an active average rejects unrelated single-test replies and uses only the final native aggregate', async () => {
+  const {host, link} = await connected();
+  await link.execute({commandId: 'measureAverage', params: {count: 3}});
+  await link.emit(status(11));
+  await link.emit(temperature);
+  await link.emit(reading);
+  assert.deepEqual(link.published.at(-1).reading, {});
+  assert.deepEqual(link.published.at(-1).temperatures, {});
+  await assert.rejects(link.execute({commandId: 'getReading'}), /no.*reading/i);
+  await link.emit(frame(3, 1, [0, 4, 0]));
+  for (let sample = 1; sample <= 3; sample++) {
+    await link.emit(frame(3, 1, [0, 5, 0]));
+    await link.emit(frame(3, 1, [2, 0, 90, 0, 2, 9, 61]));
+    await link.emit(frame(3, 1, [3, 0, 80 + sample, 0, 2, 9, 61]));
+    await link.emit(frame(3, 1, [4, 0, 251, 0, 253, sample, 3]));
+    assert.deepEqual(link.published.at(-1).reading, {});
+    await assert.rejects(link.execute({commandId: 'measure'}), /busy/i);
+  }
+  await link.emit(frame(3, 1, [0, 6, 0]));
+  assert.equal((await link.execute({commandId: 'getReading'})).reading.tds, 0.83);
+  assert.ok(Math.abs(link.published.at(-1).reading.temperatureC - 25.2) < 1e-9);
+  assert.equal(host.clock.timers.size, 0);
+  await link.execute({commandId: 'measure'});
+  await link.disconnect();
+});
+
+test('native average completion status may precede the aggregate packet', async () => {
+  const {link} = await connected();
+  await link.execute({commandId: 'measureAverage', params: {count: 3}});
+  await link.emit(frame(3, 1, [0, 6, 0]));
+  await assert.rejects(link.execute({commandId: 'getReading'}), /no.*reading/i);
+  await assert.rejects(link.execute({commandId: 'measure'}), /busy/i);
+  await link.emit(frame(3, 1, [3, 0, 81, 0, 2, 9, 61]));
+  assert.equal((await link.execute({commandId: 'getReading'})).reading.tds, 0.81);
+  await link.disconnect();
+});
+
+test('average deadline scales with requested count and ongoing status does not extend it', async () => {
+  const {host, link} = await connected({}, {MeasurementTimeoutMs: 15000});
+  await link.execute({commandId: 'measureAverage', params: {count: 3}});
+  await host.clock.tick(14000);
+  await link.emit(frame(3, 1, [0, 4, 0]));
+  await host.clock.tick(16000);
+  await link.emit(frame(3, 1, [0, 5, 0]));
+  await host.clock.tick(14999);
+  assert.equal(link.reported, 0);
+  await host.clock.tick(1);
+  assert.equal(link.reported, 1);
+  await link.emit(frame(3, 1, [0, 6, 0]));
+  await link.emit(frame(3, 1, [3, 0, 80, 0, 2, 9, 61]));
+  assert.deepEqual(link.published.at(-1).reading, {});
+  await host.clock.tick(60000);
+  assert.equal(link.reported, 1);
+  await link.disconnect();
+});
+
+test('an average device error clears the pending aggregate and permits a fresh measurement', async () => {
+  const {host, link} = await connected();
+  await link.execute({commandId: 'measureAverage', params: {count: 3}});
+  await link.emit(frame(3, 1, [3, 0, 80, 0, 2, 9, 61]));
+  await link.emit(frame(3, 254, [2, 3]));
+  assert.equal(link.published.at(-1).error, 'no_liquid');
+  assert.deepEqual(link.published.at(-1).reading, {});
+  assert.equal(host.clock.timers.size, 0);
+  await link.execute({commandId: 'measureAverage', params: {count: 2}});
+  await link.emit(frame(3, 1, [0, 6, 0]));
+  await assert.rejects(link.execute({commandId: 'getReading'}), /no.*reading/i);
+  await link.emit(frame(3, 1, [3, 0, 85, 0, 2, 9, 61]));
+  assert.equal((await link.execute({commandId: 'getReading'})).reading.tds, 0.85);
+  await link.disconnect();
+});
+
+test('native average write failure propagates and retires the session', async () => {
+  const {host, link} = await connected({write: data => {
+    if (data[2] === 3) throw new Error('average write failed');
+  }});
+  await assert.rejects(link.execute({commandId: 'measureAverage', params: {count: 3}}), /average write failed/);
+  assert.equal(link.reported, 1);
+  assert.equal(host.clock.timers.size, 0);
+  await link.disconnect();
+});
+
+for (const realBridge of [false, true]) {
+  test(`${realBridge ? 'actual bridge' : 'fake GATT'}: native average uses one counted command for counts 2, 3 and 10`, async () => {
+    const host = await load({}, {realBridge});
+    for (const [count, expected] of [[2, 'DF DF 03 01 01 02 C5'],
+      [3, 'DF DF 03 01 01 03 C6'], [10, 'DF DF 03 01 01 0A CD']]) {
+      const link = host.session(host.create());
+      await link.connection;
+      assert.deepEqual(plain(await link.execute({commandId: 'measureAverage', params: {count}})), {started: true});
+      assert.deepEqual(link.writes.filter(data => data[2] === 3), [hex(expected)]);
+      assert.equal(link.published.at(-1).status, 'average_started');
+      await link.emit(frame(3, 1, [3, 0, 80 + count, 0, 2, 9, 61]));
+      await link.emit(frame(3, 1, [0, 6, 0]));
+      assert.equal((await link.execute({commandId: 'getReading'})).reading.tds, (80 + count) / 100);
+      await link.disconnect();
+    }
+    assert.equal(host.clock.timers.size, 0);
+  });
+}
+
 test('a reading without a new temperature packet cannot inherit the last completed reading temperature', async () => {
   const {link} = await connected();
   await link.emit(temperature);

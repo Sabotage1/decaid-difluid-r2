@@ -85,7 +85,7 @@ function createPlugin(host) {
     state.commands = result.catch(() => {});
     return result;
   }
-  function beginMeasurement(state) {
+  function beginMeasurement(state, command, count = 1) {
     state.reading = {};
     state.temperatures = {};
     state.pendingTemperatures = {};
@@ -93,14 +93,18 @@ function createPlugin(host) {
     state.averageFinished = false;
     state.error = "";
     state.measuring = true;
+    state.measurementCommand = command;
     clearTimeout(state.measurementTimer);
     state.measurementTimer = setTimeout(() => report(state,
-      failure("DiFluid R2 measurement timed out", "measurement_timeout")), measurementTimeout);
+      failure("DiFluid R2 measurement timed out", "measurement_timeout")), measurementTimeout * count);
   }
   function finishMeasurement(state) {
     state.measuring = false;
     clearTimeout(state.measurementTimer);
     state.measurementTimer = null;
+    state.measurementCommand = null;
+    state.pendingAverage = null;
+    state.averageFinished = false;
   }
   function acceptReading(state, data) {
     state.reading = {tds: signed16(data, 1) / 100,
@@ -137,10 +141,10 @@ function createPlugin(host) {
       return;
     }
     if (command !== 0 && command !== 1 || !data.length) return;
+    if (state.measurementTimer != null && state.measurementCommand !== command) return;
     if (data[0] === 0 && (data.length === 2 || data.length === 3) && statuses[data[1]]) {
       const code = data[1];
-      if ([4, 7, 11].includes(code)) beginMeasurement(state);
-      else if ([5, 8, 10].includes(code) && !state.measuring) beginMeasurement(state);
+      if ([4, 5, 7, 8, 10, 11].includes(code) && state.measurementTimer == null) beginMeasurement(state, command);
       state.status = statuses[code];
       if ([0, 6, 9].includes(code)) state.measuring = false;
       if (command === 1 && code === 6) {
@@ -167,7 +171,7 @@ function createPlugin(host) {
 
   return {
     id: "difluid-r2.reaplugin",
-    version: "0.1.0",
+    version: "0.2.0",
     onLoad(values) {
       const value = values && values.MeasurementTimeoutMs !== undefined ? values.MeasurementTimeoutMs : 45000;
       if (!Number.isInteger(value) || value < 15000 || value > 180000) {
@@ -188,6 +192,10 @@ function createPlugin(host) {
               {id: "measure", name: "Measure TDS", description: "Start a single test. The result arrives on the sensor snapshot stream.",
                 paramsSchema: {type: "object", additionalProperties: false},
                 resultsSchema: {type: "object", properties: {started: {type: "boolean"}}, required: ["started"]}},
+              {id: "measureAverage", name: "Measure average TDS", description: "Start a native R2 average test with 2 to 10 samples. Updates the device's number-of-tests setting. The result arrives on the sensor snapshot stream.",
+                paramsSchema: {type: "object", properties: {count: {type: "integer", minimum: 2, maximum: 10}},
+                  required: ["count"], additionalProperties: false},
+                resultsSchema: {type: "object", properties: {started: {type: "boolean"}}, required: ["started"]}},
               {id: "getReading", name: "Get latest reading", description: "Read the completed result from this connection; fails if no result is available.",
                 paramsSchema: {type: "object", additionalProperties: false},
                 resultsSchema: {type: "object", properties: {reading: {type: "object"}}, required: ["reading"]}}
@@ -202,7 +210,7 @@ function createPlugin(host) {
                 ended: new Promise(resolve => {end = resolve;}), end,
                 commands: Promise.resolve(), publications: Promise.resolve(),
                 reading: {}, temperatures: {}, pendingTemperatures: {}, pendingAverage: null,
-                averageFinished: false, unit: 0, status: "idle", measuring: false, error: ""};
+                averageFinished: false, measurementCommand: null, unit: 0, status: "idle", measuring: false, error: ""};
               active = state;
               sessions.add(state);
               state.initializationTimer = setTimeout(() => stop(state,
@@ -228,20 +236,27 @@ function createPlugin(host) {
               const state = active;
               if (!state || state.stopped || !state.ready) throw disconnected();
               const commandId = request && request.commandId, params = request && request.params;
-              if (params != null && (typeof params !== "object" || Array.isArray(params) || Object.keys(params).length)) {
+              const average = commandId === "measureAverage";
+              if (average) {
+                if (!params || typeof params !== "object" || Array.isArray(params) ||
+                    Object.keys(params).length !== 1 || !Object.prototype.hasOwnProperty.call(params, "count") ||
+                    !Number.isInteger(params.count) || params.count < 2 || params.count > 10) {
+                  throw failure("measureAverage requires only count: an integer between 2 and 10", "invalid_argument");
+                }
+              } else if (params != null && (typeof params !== "object" || Array.isArray(params) || Object.keys(params).length)) {
                 throw failure("DiFluid R2 commands accept no parameters", "invalid_argument");
               }
               if (commandId === "getReading") {
                 if (!Object.keys(state.reading).length) throw failure("DiFluid R2 has no completed reading", "no_reading");
                 return {reading: {...state.reading}};
               }
-              if (commandId !== "measure") throw failure("Unsupported DiFluid R2 command", "unsupported_operation");
+              if (commandId !== "measure" && !average) throw failure("Unsupported DiFluid R2 command", "unsupported_operation");
               if (state.measuring || state.measurementTimer != null) throw failure("DiFluid R2 is busy", "busy");
-              beginMeasurement(state);
-              state.status = "started";
+              beginMeasurement(state, average ? 1 : 0, average ? params.count : 1);
+              state.status = average ? "average_started" : "started";
               try {
                 await publish(state);
-                await write(state, 3, 0);
+                await write(state, 3, average ? 1 : 0, average ? [params.count] : []);
                 if (state.stopped) throw disconnected();
                 return {started: true};
               } catch (error) {report(state, error); throw error;}

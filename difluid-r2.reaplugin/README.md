@@ -5,17 +5,23 @@ Installable JavaScript Bluetooth sensor driver for **DiFluid R2 Extract firmware
 refractive index, prism/sample temperatures, measurement status and device errors.
 It works alongside the BooKoo Mini scale plugin.
 
+**Hardware status:** the project owner reported on November 8, 2026 that this
+plugin was tested and found to work with an R2 refractometer. The new
+`measureAverage` command in v0.2.0 is covered by automated tests; its counted
+native-average operation still requires separate physical verification.
+
 ## Install
 
-1. Download `difluid-r2-0.1.0.zip` from the [v0.1.0 GitHub release](https://github.com/Sabotage1/decaid-difluid-r2/releases/tag/v0.1.0) and transfer it to the tablet/device running Decaid.
+1. Download `difluid-r2-0.2.0.zip` from the [v0.2.0 GitHub release](https://github.com/Sabotage1/decaid-difluid-r2/releases/tag/v0.2.0) and transfer it to the tablet/device running Decaid.
 2. Open **Plugins → cogwheel → Install plugin → ZIP file** and select the ZIP.
    Alternatively install the `difluid-r2.reaplugin` folder using **Folder snapshot**.
 3. Load/enable **DiFluid R2 Refractometer**. Turn on the R2, close its connection
    in DiFluid Café or another app, and scan for devices in Decaid.
 4. Connect the R2 supplied by this plugin. If it was already connected using
    Decaid's built-in R2 support, disconnect it and rescan first.
-5. Start a test using the R2's physical button, or send the `measure` sensor
-   command below. Read the completed result from the sensor snapshot stream.
+5. Start a test using the R2's physical button, or send the `measure` or
+   `measureAverage` sensor command below. Read the completed result from the
+   sensor snapshot stream.
 
 Decaid 0.9.0 already contains a native R2 integration. This plugin provides an
 independently installable alternative using its driver runtime. It overrides
@@ -44,8 +50,22 @@ Send this JSON to `POST /api/v1/sensors/<encoded-id>/execute`:
 {"commandId":"measure","params":{}}
 ```
 
-The command returns `{"started":true}` after the acknowledged Bluetooth write.
-It does **not** wait for the measurement. Decaid limits plugin invocations to ten
+For a native average test with three samples, use:
+
+```json
+{"commandId":"measureAverage","params":{"count":3}}
+```
+
+`measureAverage` requires exactly one parameter: `count`, an integer from **2 to
+10**, inclusive. Missing counts, strings, fractions, out-of-range values and
+unknown parameters are rejected before any state changes or Bluetooth writes.
+The driver sends a single native R2 Average command with the requested count;
+for three tests the exact frame is `DF DF 03 01 01 03 C6`. It neither sends
+repeated single tests nor computes an average in JavaScript. DiFluid documents
+that this native command also affects the device's number-of-tests setting.
+
+Both commands return `{"started":true}` after the acknowledged Bluetooth write.
+They do **not** wait for the measurement. Decaid limits plugin invocations to ten
 seconds, while R2 tests can take longer. Subscribe to
 `/ws/v1/sensors/<encoded-id>/snapshot` **before** starting a test and wait for a
 nonempty `reading` object, or poll the `getReading` command:
@@ -55,9 +75,12 @@ nonempty `reading` object, or poll the `getReading` command:
 ```
 
 `getReading` returns `{"reading":{...}}` for the latest completed test on this
-connection. It fails with `no_reading` before a result or during a new test.
+connection, whether single or averaged. It fails with `no_reading` before a
+result or during a new test, including intermediate average results.
 Decaid may wrap these command results in its normal API response envelope.
-Commands accept no parameters. A second `measure` while busy is rejected.
+`measure` and `getReading` continue to accept no parameters. `measureAverage`
+accepts only the required count. Single and average requests share one busy
+slot; neither can start until the current test delivers its result or error.
 
 ## Snapshot contract
 
@@ -89,7 +112,8 @@ uses the four bytes in DiFluid's example, divided by 100000. Temperatures are
 normalized to Celsius from each packet's unit; `temperature` and `temperatureC`
 are the mean of prism and sample temperatures, matching Decaid's native R2
 convention. The plugin queries the unit during initialization and does not
-change the R2's stored unit or other settings.
+change the R2's stored temperature unit. A native average request affects the
+number-of-tests setting as described above.
 
 Temperature fields are omitted from `reading` if no temperature packet arrived
 for that result. Old temperatures are not attached to a new reading. No zero
@@ -105,13 +129,20 @@ skin tile, compute extraction yield, or save TDS to a shot automatically.
 Physical-button single tests and passive average-test notifications are handled.
 Average readings publish only after the device's final status, using the latest
 aggregate; intermediate samples are not exposed as completed results. The
-`measure` command always requests a single test. Calibration results are ignored
-as coffee readings, and calibration/settings-changing commands are not exposed.
+`measure` command always requests a single test; `measureAverage` initiates the
+native Average test with the requested count. Replies for the other measurement
+mode cannot complete an active request. Calibration results are ignored as
+coffee readings; calibration and standalone settings commands are not exposed.
 
 ## Timeouts and connection behavior
 
 **Measurement timeout (milliseconds)** defaults to `45000`; allowed integers are
-`15000`–`180000`. It starts for an active test. An unanswered finished status
+`15000`–`180000`. It is the deadline for a single test; an API-triggered average
+gets a total deadline of **`MeasurementTimeoutMs × count`**, starting when the
+request is accepted. A three-test average therefore defaults to 135 seconds.
+Start and ongoing status packets do not extend an active request's deadline.
+Passive physical-button tests retain the configured single deadline because
+their count is not supplied by an API request. An unanswered finished status
 still has to deliver a result before this deadline. On timeout, the plugin logs
 the failure, retires its session and reports disconnection to Decaid. Late
 callbacks cannot publish or satisfy a later request on a replacement session.
@@ -129,21 +160,27 @@ There are no npm dependencies. The build checks syntax, runs the R2 tests,
 packages the plugin with its license and README, verifies ZIP contents against
 source, and writes `dist/SHA256SUMS`.
 
-R2 tests cover manufacturer example packets, signed values, temperature units,
-checksums/lengths, absent data, average results, errors, readiness, timeouts,
-busy requests, write failures, unload and stale callbacks. Four simultaneous
+The 26 R2 tests cover manufacturer example packets, signed values, temperature units,
+checksums/lengths, absent data, native counted-average writes, strict count
+validation, final aggregate handling, mode isolation, errors, readiness,
+per-count timeouts, busy requests, write failures, unload and stale callbacks. Four simultaneous
 instances are also tested through **Decaid v0.9.0's actual JavaScript BLE bridge**
 with a simulated Dart/GATT boundary. These checks do not execute the Flutter
 host, prove host binding quotas/permission UI, or exercise physical Bluetooth.
 
-**No physical R2 or installed-Decaid test has been performed.** Before relying
-on it, record R2 firmware, Decaid version and tablet/OS, then verify:
+**User-reported hardware test:** on November 8, 2026, the project owner confirmed
+that the plugin was tested and found to work with a physical R2 refractometer.
+The report does not specify a firmware/OS matrix or validate the newly added
+counted-average API. For further acceptance testing, record R2 firmware, Decaid
+version and tablet/OS, then verify:
 
 1. Discovery/connect alongside the BooKoo scale; the scale remains primary.
 2. A physical-button test and an API-triggered single test, comparing TDS and
    refractive index with the R2 display or DiFluid Café.
 3. Celsius and Fahrenheit settings; compare both temperatures with the device.
-4. No-liquid/error handling and an average test if you use that device mode.
+4. No-liquid/error handling, a physical-button average, and API native averages
+   with requested counts (including 2, 3 and 10); compare the completed average
+   and count with the device. Confirm single tests are unchanged afterwards.
 5. Power-off, reconnect, plugin unload/reload and tablet background/foreground.
 
 ## Sources and license
